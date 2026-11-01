@@ -28,6 +28,7 @@ import okhttp3.Response
 import okio.Buffer
 import okio.BufferedSource
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * AWS Bedrock Converse API, authenticated with a Bedrock API key (Bearer token).
@@ -63,8 +64,19 @@ class BedrockConverseHandler : AiProtocolHandler {
         val provider = request.model.provider
         requireConfigured(request)
         val keyRotator = KeyRotator(provider.apiKey)
-        val body = GSON.toJson(request.toConverseBody())
         val url = request.modelUrl("converse")
+        return request.withRequestShape { shape ->
+            generateWithShape(request, url, GSON.toJson(request.toConverseBody(shape)), keyRotator)
+        }
+    }
+
+    private suspend fun generateWithShape(
+        request: AiGenerateRequest,
+        url: String,
+        body: String,
+        keyRotator: KeyRotator,
+    ): AiGenerateResponse {
+        val provider = request.model.provider
         return retryWithBackoff(maxAttempts = 3, keyRotator = keyRotator) {
             val response = request.httpClient().newCallStrResponse {
                 url(url)
@@ -96,19 +108,21 @@ class BedrockConverseHandler : AiProtocolHandler {
         val provider = request.model.provider
         requireConfigured(request)
         val keyRotator = KeyRotator(provider.apiKey)
-        val body = GSON.toJson(request.toConverseBody())
         val url = request.modelUrl("converse-stream")
-        val response = retryWithBackoff(maxAttempts = 3, keyRotator = keyRotator) {
-            request.httpClient().newCallResponse {
-                url(url)
-                postJson(body)
-                addHeaders(
-                    provider.bedrockHeaders(request.sessionId, keyRotator.currentKey) +
-                        ("Accept" to "application/vnd.amazon.eventstream")
-                )
-            }.also {
-                if (!it.isSuccessful) {
-                    throw AiHttpException(it.code, it.httpErrorMessage())
+        val response = request.withRequestShape { shape ->
+            val body = GSON.toJson(request.toConverseBody(shape))
+            retryWithBackoff(maxAttempts = 3, keyRotator = keyRotator) {
+                request.httpClient().newCallResponse {
+                    url(url)
+                    postJson(body)
+                    addHeaders(
+                        provider.bedrockHeaders(request.sessionId, keyRotator.currentKey) +
+                            ("Accept" to "application/vnd.amazon.eventstream")
+                    )
+                }.also {
+                    if (!it.isSuccessful) {
+                        throw AiHttpException(it.code, it.httpErrorMessage())
+                    }
                 }
             }
         }
@@ -219,16 +233,57 @@ private fun AiGenerateRequest.modelUrl(action: String): String {
     return "${model.provider.baseUrl.trimEnd('/')}/model/$modelId/$action"
 }
 
-private fun AiGenerateRequest.toConverseBody(): Map<String, Any?> {
+/**
+ * Request shape a Bedrock model accepts. Claude generations disagree (checked on Bedrock
+ * 2026-11-01): 5.x rejects `temperature` and `thinking.type: enabled`, 4.5 rejects adaptive
+ * thinking and `output_config.effort`, 4.6 takes both. Rather than pin model versions, requests
+ * start from the current shape and [adjustFor] flips the one setting a 400 names.
+ */
+internal data class BedrockRequestShape(
+    val adaptiveThinking: Boolean = true,
+    val sampling: Boolean = true,
+) {
+    /** The shape to retry with after a 400 [message], or null when the error is not about the shape. */
+    fun adjustFor(message: String): BedrockRequestShape? = when {
+        sampling && ("`temperature` is deprecated" in message || "`top_p` is deprecated" in message) ->
+            copy(sampling = false)
+        adaptiveThinking && ("adaptive thinking is not supported" in message ||
+            "output_config.effort: Extra inputs are not permitted" in message) -> copy(adaptiveThinking = false)
+        !adaptiveThinking && "\"thinking.type.enabled\" is not supported" in message -> copy(adaptiveThinking = true)
+        else -> null
+    }
+}
+
+/** Learned per model id so later chunks of the same chapter skip the failing first attempt. */
+private val bedrockRequestShapes = ConcurrentHashMap<String, BedrockRequestShape>()
+
+/** Runs [block] with the model's request shape, retrying up to 3 times while a 400 names a shape problem. */
+private suspend fun <T> AiGenerateRequest.withRequestShape(block: suspend (BedrockRequestShape) -> T): T {
+    var shape = bedrockRequestShapes[model.modelId] ?: BedrockRequestShape()
+    repeat(3) {
+        try {
+            return block(shape)
+        } catch (e: AiHttpException) {
+            val next = shape.takeIf { e.statusCode == 400 }?.adjustFor(e.message.orEmpty()) ?: throw e
+            shape = next
+            bedrockRequestShapes[model.modelId] = next
+        }
+    }
+    return block(shape)
+}
+
+internal fun AiGenerateRequest.toConverseBody(shape: BedrockRequestShape = BedrockRequestShape()): Map<String, Any?> {
     val body = mutableMapOf<String, Any?>("messages" to messages.toBedrockMessages())
     messages.filter { it.role == AiMessageRole.SYSTEM && it.content.isNotBlank() }
         .takeIf { it.isNotEmpty() }
         ?.let { system -> body["system"] = system.map { mapOf("text" to it.content) } }
     val inferenceConfig = mutableMapOf<String, Any>()
     (params.maxOutputTokens ?: model.maxOutputTokens.takeIf { it > 0 })?.let { inferenceConfig["maxTokens"] = it }
-    params.temperature?.let { inferenceConfig["temperature"] = it }
-    params.topP?.let { inferenceConfig["topP"] = it }
-    bedrockReasoningFields(inferenceConfig)?.let { body["additionalModelRequestFields"] = it }
+    if (shape.sampling) {
+        params.temperature?.let { inferenceConfig["temperature"] = it }
+        params.topP?.let { inferenceConfig["topP"] = it }
+    }
+    bedrockReasoningFields(inferenceConfig, shape)?.let { body["additionalModelRequestFields"] = it }
     if (inferenceConfig.isNotEmpty()) body["inferenceConfig"] = inferenceConfig
     tools.takeIf { it.isNotEmpty() }?.let { body["toolConfig"] = mapOf("tools" to it.toBedrockTools()) }
     return body
@@ -237,12 +292,16 @@ private fun AiGenerateRequest.toConverseBody(): Map<String, Any?> {
 /**
  * Model-family reasoning switches for Converse `additionalModelRequestFields`, and the
  * [inferenceConfig] adjustments each family requires while reasoning:
- * - Anthropic Claude: `thinking` with `budget_tokens` (min 1024, below maxTokens; no temperature/topP)
+ * - Anthropic Claude: adaptive `thinking` + `output_config.effort`, or on older models `thinking`
+ *   with `budget_tokens` (min 1024, below maxTokens); no temperature/topP either way
  * - Amazon Nova: `reasoningConfig` with `maxReasoningEffort` (high also forbids maxTokens)
  * - OpenAI gpt-oss: `reasoning_effort`
  * AUTO leaves the model default; models without the reasoning capability get nothing.
  */
-internal fun AiGenerateRequest.bedrockReasoningFields(inferenceConfig: MutableMap<String, Any>): Map<String, Any>? {
+internal fun AiGenerateRequest.bedrockReasoningFields(
+    inferenceConfig: MutableMap<String, Any>,
+    shape: BedrockRequestShape = BedrockRequestShape(),
+): Map<String, Any>? {
     if (!hasReasoningCapability(model.capabilities)) return null
     val level = params.reasoningLevel
     if (level == AiReasoningLevel.AUTO) return null
@@ -255,15 +314,19 @@ internal fun AiGenerateRequest.bedrockReasoningFields(inferenceConfig: MutableMa
     return when {
         "anthropic.claude" in id -> {
             // Claude rejects a tool-use turn replayed without its signed thinking block, which
-            // AiMessage does not keep, so thinking stays off once the conversation has tool calls.
-            if (level == AiReasoningLevel.OFF || messages.any { it.toolCalls.isNotEmpty() }) {
-                return mapOf("thinking" to mapOf("type" to "disabled"))
+            // AiMessage does not keep, so no thinking once the conversation has tool calls. OFF
+            // also sends nothing: newer models reject `thinking.type: disabled`.
+            if (level == AiReasoningLevel.OFF || messages.any { it.toolCalls.isNotEmpty() }) return null
+            inferenceConfig.remove("temperature")
+            inferenceConfig.remove("topP")
+            if (shape.adaptiveThinking) {
+                // Accepted on 4.6 and 5.x: low / medium / high / max (4.6 rejects xhigh).
+                val claudeEffort = if (level == AiReasoningLevel.MAX) "max" else effort
+                return mapOf("thinking" to mapOf("type" to "adaptive"), "output_config" to mapOf("effort" to claudeEffort))
             }
             val budget = level.budgetTokens.coerceAtLeast(1024)
             val maxTokens = (inferenceConfig["maxTokens"] as? Int) ?: 0
             if (maxTokens <= budget) inferenceConfig["maxTokens"] = budget + 4096
-            inferenceConfig.remove("temperature")
-            inferenceConfig.remove("topP")
             mapOf("thinking" to mapOf("type" to "enabled", "budget_tokens" to budget))
         }
         "amazon.nova" in id -> {

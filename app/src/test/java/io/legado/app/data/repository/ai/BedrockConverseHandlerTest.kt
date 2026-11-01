@@ -36,27 +36,78 @@ class BedrockConverseHandlerTest {
     )
 
     @Test
-    fun claudeThinkingUsesBudgetAboveMaxTokensAndDropsSampling() {
+    fun claudeThinkingDefaultsToAdaptiveEffortAndDropsSampling() {
         val config = mutableMapOf<String, Any>("maxTokens" to 2048, "temperature" to 0.3f, "topP" to 0.9f)
 
-        val fields = request("us.anthropic.claude-sonnet-4-20250514-v1:0", AiReasoningLevel.HIGH)
-            .bedrockReasoningFields(config)
+        val fields = request("us.anthropic.claude-sonnet-5-5", AiReasoningLevel.HIGH).bedrockReasoningFields(config)
+
+        assertEquals(
+            mapOf("thinking" to mapOf("type" to "adaptive"), "output_config" to mapOf("effort" to "high")),
+            fields
+        )
+        assertEquals(mapOf<String, Any>("maxTokens" to 2048), config)
+        assertEquals(
+            mapOf("effort" to "max"),
+            request("us.anthropic.claude-sonnet-5-5", AiReasoningLevel.MAX).bedrockReasoningFields(mutableMapOf())
+                ?.get("output_config")
+        )
+    }
+
+    @Test
+    fun olderClaudeShapeUsesBudgetAboveMaxTokens() {
+        val config = mutableMapOf<String, Any>("maxTokens" to 2048, "temperature" to 0.3f, "topP" to 0.9f)
+
+        val fields = request("us.anthropic.claude-sonnet-4-5-20250929-v1:0", AiReasoningLevel.HIGH)
+            .bedrockReasoningFields(config, BedrockRequestShape(adaptiveThinking = false))
 
         assertEquals(mapOf("thinking" to mapOf("type" to "enabled", "budget_tokens" to 8_000)), fields)
         assertEquals(mapOf<String, Any>("maxTokens" to 12_096), config)
     }
 
     @Test
-    fun claudeThinkingStaysOffAfterToolCalls() {
+    fun claudeSendsNoThinkingWhenOffOrAfterToolCalls() {
         val messages = listOf(
             AiMessage(AiMessageRole.USER, "hi"),
             AiMessage(AiMessageRole.ASSISTANT, "", toolCalls = listOf(AiToolCall("c", "t", "{}"))),
             AiMessage(AiMessageRole.TOOL, "ok", toolCallId = "c"),
         )
-        val fields = request("anthropic.claude-sonnet-4-20250514-v1:0", AiReasoningLevel.MEDIUM, messages = messages)
-            .bedrockReasoningFields(mutableMapOf())
+        assertNull(
+            request("us.anthropic.claude-sonnet-5-5", AiReasoningLevel.MEDIUM, messages = messages)
+                .bedrockReasoningFields(mutableMapOf())
+        )
+        assertNull(request("us.anthropic.claude-sonnet-5-5", AiReasoningLevel.OFF).bedrockReasoningFields(mutableMapOf()))
+    }
 
-        assertEquals(mapOf("thinking" to mapOf("type" to "disabled")), fields)
+    /** Error messages returned by Bedrock on 2026-11-01 for the models in the comment on [BedrockRequestShape]. */
+    @Test
+    fun requestShapeAdjustsToBedrockErrors() {
+        val start = BedrockRequestShape()
+        val temperature = "HTTP 400: {\"message\":\"The model returned the following errors: `temperature` is deprecated for this model.\"}"
+        val adaptive = "HTTP 400: {\"message\":\"The model returned the following errors: adaptive thinking is not supported on this model\"}"
+        val effort = "HTTP 400: {\"message\":\"The model returned the following errors: output_config.effort: Extra inputs are not permitted\"}"
+        val enabled = "HTTP 400: {\"message\":\"The model returned the following errors: \\\"thinking.type.enabled\\\" is not supported for this model.\"}"
+            .replace("\\\"", "\"")
+
+        assertEquals(BedrockRequestShape(sampling = false), start.adjustFor(temperature))
+        assertEquals(BedrockRequestShape(adaptiveThinking = false), start.adjustFor(adaptive))
+        assertEquals(BedrockRequestShape(adaptiveThinking = false), start.adjustFor(effort))
+        assertEquals(start, BedrockRequestShape(adaptiveThinking = false).adjustFor(enabled))
+        assertNull(start.adjustFor("HTTP 400: {\"message\":\"Malformed input request\"}"))
+        assertNull(BedrockRequestShape(sampling = false).adjustFor(temperature))
+    }
+
+    @Test
+    fun bodyOmitsSamplingWhenShapeSaysSo() {
+        val noReasoning = request("us.anthropic.claude-sonnet-5-5", AiReasoningLevel.AUTO, maxTokens = 500)
+
+        assertEquals(
+            mapOf("maxTokens" to 500, "temperature" to 0.3f, "topP" to 0.9f),
+            noReasoning.toConverseBody()["inferenceConfig"]
+        )
+        assertEquals(
+            mapOf("maxTokens" to 500),
+            noReasoning.toConverseBody(BedrockRequestShape(sampling = false))["inferenceConfig"]
+        )
     }
 
     @Test
@@ -76,7 +127,7 @@ class BedrockConverseHandlerTest {
 
     @Test
     fun autoLevelOrOtherModelsSendNoReasoningFields() {
-        assertNull(request("us.anthropic.claude-sonnet-4-20250514-v1:0", AiReasoningLevel.AUTO).bedrockReasoningFields(mutableMapOf()))
+        assertNull(request("us.anthropic.claude-sonnet-5-5", AiReasoningLevel.AUTO).bedrockReasoningFields(mutableMapOf()))
         assertNull(request("meta.llama3-70b-instruct-v1:0", AiReasoningLevel.HIGH).bedrockReasoningFields(mutableMapOf()))
     }
 
