@@ -148,8 +148,8 @@ object AiProviderPresets {
             protocol = AiProtocol.AWS_BEDROCK_CONVERSE,
             baseUrl = "https://bedrock-runtime.us-east-1.amazonaws.com",
             modelsUrl = "https://bedrock.us-east-1.amazonaws.com/inference-profiles?maxResults=1000",
-            modelName = "Claude Sonnet",
-            modelId = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+            modelName = "Claude Sonnet 5.5",
+            modelId = "us.anthropic.claude-sonnet-5-5"
         ),
         AiProviderPreset(
             id = "opencode_go",
