@@ -30,9 +30,7 @@ import okio.BufferedSource
 import java.net.URLEncoder
 
 /**
- * AWS Bedrock Converse API. The API key field holds either a Bedrock API key (sent as a Bearer
- * token) or IAM credentials `AccessKeyId:SecretAccessKey[:SessionToken]` (signed with SigV4; the
- * region is read from the endpoint host).
+ * AWS Bedrock Converse API, authenticated with a Bedrock API key (Bearer token).
  *
  * Bedrock serves inference and model listing from different hosts, so both URLs are configured
  * separately on the provider:
@@ -71,7 +69,7 @@ class BedrockConverseHandler : AiProtocolHandler {
             val response = request.httpClient().newCallStrResponse {
                 url(url)
                 postJson(body)
-                addHeaders(provider.bedrockHeaders(request.sessionId, keyRotator.currentKey, "POST", url, body))
+                addHeaders(provider.bedrockHeaders(request.sessionId, keyRotator.currentKey))
             }
             if (!response.isSuccessful()) {
                 throw AiHttpException(response.code(), response.httpErrorMessage())
@@ -105,7 +103,7 @@ class BedrockConverseHandler : AiProtocolHandler {
                 url(url)
                 postJson(body)
                 addHeaders(
-                    provider.bedrockHeaders(request.sessionId, keyRotator.currentKey, "POST", url, body) +
+                    provider.bedrockHeaders(request.sessionId, keyRotator.currentKey) +
                         ("Accept" to "application/vnd.amazon.eventstream")
                 )
             }.also {
@@ -180,7 +178,7 @@ class BedrockConverseHandler : AiProtocolHandler {
             val json = retryWithBackoff(maxAttempts = 2, keyRotator = keyRotator) {
                 val response = okHttpClient.newCallStrResponse {
                     url(pageUrl)
-                    addHeaders(provider.bedrockHeaders(null, keyRotator.currentKey, "GET", pageUrl, ""))
+                    addHeaders(provider.bedrockHeaders(null, keyRotator.currentKey))
                 }
                 if (!response.isSuccessful()) {
                     throw AiHttpException(response.code(), response.httpErrorMessage())
@@ -206,26 +204,14 @@ class BedrockConverseHandler : AiProtocolHandler {
     }
 }
 
-/** Bearer for a Bedrock API key, SigV4 (service `bedrock`) for IAM credentials. */
-private fun AiProviderConfig.bedrockHeaders(
-    sessionId: String?,
-    key: String,
-    method: String,
-    url: String,
-    body: String,
-): Map<String, String> {
-    val credentials = AwsCredentials.parse(key)
-    val auth = if (credentials == null) {
-        mapOf("Authorization" to "Bearer $key")
-    } else {
-        val httpUrl = url.toHttpUrl()
-        AwsSigV4.sign(method, httpUrl, body.toByteArray(), credentials, AwsSigV4.regionOf(httpUrl), "bedrock")
-    }
-    return aiRequestHeaders(
+private fun AiProviderConfig.bedrockHeaders(sessionId: String?, apiKey: String): Map<String, String> =
+    aiRequestHeaders(
         sessionId = sessionId,
-        protocolHeaders = auth + ("Content-Type" to "application/json")
+        protocolHeaders = mapOf(
+            "Authorization" to "Bearer $apiKey",
+            "Content-Type" to "application/json"
+        )
     )
-}
 
 /** Model ids may be ARNs containing `/` and `:`, so the id is sent as one encoded path segment. */
 private fun AiGenerateRequest.modelUrl(action: String): String {

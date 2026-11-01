@@ -2370,7 +2370,7 @@
     <string name="ai_models_url">Models URL</string>
     <string name="ai_api_key">API Key</string>
     <string name="ai_api_key_summary">Stored locally. Leave blank to keep the saved key.</string>
-    <string name="ai_bedrock_api_key_summary">Bedrock API key, or IAM credentials AccessKeyId:SecretAccessKey[:SessionToken] (SigV4, region read from the URL). Stored locally.</string>
+    <string name="ai_bedrock_api_key_summary">Amazon Bedrock API key (not IAM access keys). Stored locally. Leave blank to keep the saved key.</string>
     <string name="ai_model_config">Model</string>
     <string name="ai_model_edit">Model Configuration</string>
     <string name="ai_provider_models">Provider Models</string>

@@ -1619,7 +1619,7 @@
     <string name="ai_delete_model_confirm">確定要刪除此模型嗎？</string>
     <string name="ai_api_key">API Key</string>
     <string name="ai_api_key_summary">儲存在本機。留空則保留已儲存的金鑰。</string>
-    <string name="ai_bedrock_api_key_summary">填寫 Bedrock API Key，或 IAM 憑證 AccessKeyId:SecretAccessKey[:SessionToken]（使用 SigV4 簽名，區域從 URL 讀取）。儲存在本機。</string>
+    <string name="ai_bedrock_api_key_summary">填寫 Amazon Bedrock API Key（不支援 IAM 存取金鑰）。儲存在本機。留空則保留已儲存的金鑰。</string>
     <string name="ai_assistant">助手</string>
     <string name="ai_base_url">Base URL</string>
     <string name="ai_book_results">相關書籍</string>

@@ -2257,7 +2257,7 @@
     <string name="ai_models_url">模型 URL</string>
     <string name="ai_api_key">API 金鑰</string>
     <string name="ai_api_key_summary">儲存在本機。留空則保留已儲存的金鑰。</string>
-    <string name="ai_bedrock_api_key_summary">填寫 Bedrock API Key，或 IAM 憑證 AccessKeyId:SecretAccessKey[:SessionToken]（使用 SigV4 簽名，區域從 URL 讀取）。儲存在本機。</string>
+    <string name="ai_bedrock_api_key_summary">填寫 Amazon Bedrock API Key（不支援 IAM 存取金鑰）。儲存在本機。留空則保留已儲存的金鑰。</string>
     <string name="ai_model_config">模型</string>
     <string name="ai_model_edit">模型設定</string>
     <string name="ai_provider_models">供應商模型</string>
