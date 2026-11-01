@@ -2426,6 +2426,7 @@
     <string name="ai_models_url">模型列表 URL</string>
     <string name="ai_api_key">API Key</string>
     <string name="ai_api_key_summary">保存在本地。留空会保留已保存的密钥。</string>
+    <string name="ai_bedrock_api_key_summary">填写 Bedrock API Key，或 IAM 凭证 AccessKeyId:SecretAccessKey[:SessionToken]（使用 SigV4 签名，区域从 URL 读取）。保存在本地。</string>
     <string name="ai_model_config">模型</string>
     <string name="ai_model_edit">模型配置</string>
     <string name="ai_provider_models">供应商模型</string>
