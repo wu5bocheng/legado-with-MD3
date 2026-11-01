@@ -10,6 +10,7 @@ import io.legado.app.domain.model.AiMessage
 import io.legado.app.domain.model.AiMessageRole
 import io.legado.app.domain.model.AiProtocol
 import io.legado.app.domain.model.AiProviderConfig
+import io.legado.app.domain.model.AiReasoningLevel
 import io.legado.app.domain.model.AiToolDefinition
 import io.legado.app.help.http.addHeaders
 import io.legado.app.help.http.newCallResponse
@@ -22,13 +23,16 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Response
 import okio.Buffer
 import okio.BufferedSource
 import java.net.URLEncoder
 
 /**
- * AWS Bedrock Converse API, authenticated with a Bedrock API key (Bearer token).
+ * AWS Bedrock Converse API. The API key field holds either a Bedrock API key (sent as a Bearer
+ * token) or IAM credentials `AccessKeyId:SecretAccessKey[:SessionToken]` (signed with SigV4; the
+ * region is read from the endpoint host).
  *
  * Bedrock serves inference and model listing from different hosts, so both URLs are configured
  * separately on the provider:
@@ -61,12 +65,13 @@ class BedrockConverseHandler : AiProtocolHandler {
         val provider = request.model.provider
         requireConfigured(request)
         val keyRotator = KeyRotator(provider.apiKey)
-        val body = request.toConverseBody()
+        val body = GSON.toJson(request.toConverseBody())
+        val url = request.modelUrl("converse")
         return retryWithBackoff(maxAttempts = 3, keyRotator = keyRotator) {
             val response = request.httpClient().newCallStrResponse {
-                url(request.modelUrl("converse"))
-                postJson(GSON.toJson(body))
-                addHeaders(provider.bedrockHeaders(request.sessionId, keyRotator.currentKey))
+                url(url)
+                postJson(body)
+                addHeaders(provider.bedrockHeaders(request.sessionId, keyRotator.currentKey, "POST", url, body))
             }
             if (!response.isSuccessful()) {
                 throw AiHttpException(response.code(), response.httpErrorMessage())
@@ -93,13 +98,14 @@ class BedrockConverseHandler : AiProtocolHandler {
         val provider = request.model.provider
         requireConfigured(request)
         val keyRotator = KeyRotator(provider.apiKey)
-        val body = request.toConverseBody()
+        val body = GSON.toJson(request.toConverseBody())
+        val url = request.modelUrl("converse-stream")
         val response = retryWithBackoff(maxAttempts = 3, keyRotator = keyRotator) {
             request.httpClient().newCallResponse {
-                url(request.modelUrl("converse-stream"))
-                postJson(GSON.toJson(body))
+                url(url)
+                postJson(body)
                 addHeaders(
-                    provider.bedrockHeaders(request.sessionId, keyRotator.currentKey) +
+                    provider.bedrockHeaders(request.sessionId, keyRotator.currentKey, "POST", url, body) +
                         ("Accept" to "application/vnd.amazon.eventstream")
                 )
             }.also {
@@ -164,16 +170,27 @@ class BedrockConverseHandler : AiProtocolHandler {
                 "Bedrock models URL is required, e.g. https://bedrock.us-east-1.amazonaws.com/inference-profiles"
             )
         val keyRotator = KeyRotator(provider.apiKey)
-        return retryWithBackoff(maxAttempts = 2, keyRotator = keyRotator) {
-            val response = okHttpClient.newCallStrResponse {
-                url(modelsUrl)
-                addHeaders(provider.bedrockHeaders(null, keyRotator.currentKey))
+        val models = mutableListOf<AiAvailableModel>()
+        var nextToken: String? = null
+        for (page in 1..MAX_MODEL_PAGES) {
+            val pageUrl = modelsUrl.toHttpUrl().newBuilder()
+                .apply { nextToken?.let { setQueryParameter("nextToken", it) } }
+                .build()
+                .toString()
+            val json = retryWithBackoff(maxAttempts = 2, keyRotator = keyRotator) {
+                val response = okHttpClient.newCallStrResponse {
+                    url(pageUrl)
+                    addHeaders(provider.bedrockHeaders(null, keyRotator.currentKey, "GET", pageUrl, ""))
+                }
+                if (!response.isSuccessful()) {
+                    throw AiHttpException(response.code(), response.httpErrorMessage())
+                }
+                response.body?.toJsonObject()
             }
-            if (!response.isSuccessful()) {
-                throw AiHttpException(response.code(), response.httpErrorMessage())
-            }
-            response.body?.toJsonObject().toBedrockModels()
+            models += json.toBedrockModels()
+            nextToken = json?.getString("nextToken")?.takeIf { it.isNotBlank() } ?: break
         }
+        return models.distinctBy { it.id }.sortedBy { it.name.lowercase() }
     }
 
     private fun requireConfigured(request: AiGenerateRequest) {
@@ -182,16 +199,33 @@ class BedrockConverseHandler : AiProtocolHandler {
             "Bedrock configuration incomplete: baseUrl, apiKey, and model are required"
         }
     }
+
+    private companion object {
+        /** ListInferenceProfiles / ListFoundationModels pages; guards against a token that never ends. */
+        const val MAX_MODEL_PAGES = 50
+    }
 }
 
-private fun AiProviderConfig.bedrockHeaders(sessionId: String?, apiKey: String): Map<String, String> =
-    aiRequestHeaders(
+/** Bearer for a Bedrock API key, SigV4 (service `bedrock`) for IAM credentials. */
+private fun AiProviderConfig.bedrockHeaders(
+    sessionId: String?,
+    key: String,
+    method: String,
+    url: String,
+    body: String,
+): Map<String, String> {
+    val credentials = AwsCredentials.parse(key)
+    val auth = if (credentials == null) {
+        mapOf("Authorization" to "Bearer $key")
+    } else {
+        val httpUrl = url.toHttpUrl()
+        AwsSigV4.sign(method, httpUrl, body.toByteArray(), credentials, AwsSigV4.regionOf(httpUrl), "bedrock")
+    }
+    return aiRequestHeaders(
         sessionId = sessionId,
-        protocolHeaders = mapOf(
-            "Authorization" to "Bearer $apiKey",
-            "Content-Type" to "application/json"
-        )
+        protocolHeaders = auth + ("Content-Type" to "application/json")
     )
+}
 
 /** Model ids may be ARNs containing `/` and `:`, so the id is sent as one encoded path segment. */
 private fun AiGenerateRequest.modelUrl(action: String): String {
@@ -204,14 +238,62 @@ private fun AiGenerateRequest.toConverseBody(): Map<String, Any?> {
     messages.filter { it.role == AiMessageRole.SYSTEM && it.content.isNotBlank() }
         .takeIf { it.isNotEmpty() }
         ?.let { system -> body["system"] = system.map { mapOf("text" to it.content) } }
-    val inferenceConfig = buildMap<String, Any> {
-        (params.maxOutputTokens ?: model.maxOutputTokens.takeIf { it > 0 })?.let { put("maxTokens", it) }
-        params.temperature?.let { put("temperature", it) }
-        params.topP?.let { put("topP", it) }
-    }
+    val inferenceConfig = mutableMapOf<String, Any>()
+    (params.maxOutputTokens ?: model.maxOutputTokens.takeIf { it > 0 })?.let { inferenceConfig["maxTokens"] = it }
+    params.temperature?.let { inferenceConfig["temperature"] = it }
+    params.topP?.let { inferenceConfig["topP"] = it }
+    bedrockReasoningFields(inferenceConfig)?.let { body["additionalModelRequestFields"] = it }
     if (inferenceConfig.isNotEmpty()) body["inferenceConfig"] = inferenceConfig
     tools.takeIf { it.isNotEmpty() }?.let { body["toolConfig"] = mapOf("tools" to it.toBedrockTools()) }
     return body
+}
+
+/**
+ * Model-family reasoning switches for Converse `additionalModelRequestFields`, and the
+ * [inferenceConfig] adjustments each family requires while reasoning:
+ * - Anthropic Claude: `thinking` with `budget_tokens` (min 1024, below maxTokens; no temperature/topP)
+ * - Amazon Nova: `reasoningConfig` with `maxReasoningEffort` (high also forbids maxTokens)
+ * - OpenAI gpt-oss: `reasoning_effort`
+ * AUTO leaves the model default; models without the reasoning capability get nothing.
+ */
+internal fun AiGenerateRequest.bedrockReasoningFields(inferenceConfig: MutableMap<String, Any>): Map<String, Any>? {
+    if (!hasReasoningCapability(model.capabilities)) return null
+    val level = params.reasoningLevel
+    if (level == AiReasoningLevel.AUTO) return null
+    val id = model.modelId.lowercase()
+    val effort = when (level) {
+        AiReasoningLevel.LOW -> "low"
+        AiReasoningLevel.MEDIUM -> "medium"
+        else -> "high"
+    }
+    return when {
+        "anthropic.claude" in id -> {
+            // Claude rejects a tool-use turn replayed without its signed thinking block, which
+            // AiMessage does not keep, so thinking stays off once the conversation has tool calls.
+            if (level == AiReasoningLevel.OFF || messages.any { it.toolCalls.isNotEmpty() }) {
+                return mapOf("thinking" to mapOf("type" to "disabled"))
+            }
+            val budget = level.budgetTokens.coerceAtLeast(1024)
+            val maxTokens = (inferenceConfig["maxTokens"] as? Int) ?: 0
+            if (maxTokens <= budget) inferenceConfig["maxTokens"] = budget + 4096
+            inferenceConfig.remove("temperature")
+            inferenceConfig.remove("topP")
+            mapOf("thinking" to mapOf("type" to "enabled", "budget_tokens" to budget))
+        }
+        "amazon.nova" in id -> {
+            if (level == AiReasoningLevel.OFF) {
+                return mapOf("reasoningConfig" to mapOf("type" to "disabled"))
+            }
+            inferenceConfig.remove("temperature")
+            inferenceConfig.remove("topP")
+            if (effort == "high") inferenceConfig.remove("maxTokens")
+            mapOf("reasoningConfig" to mapOf("type" to "enabled", "maxReasoningEffort" to effort))
+        }
+        "openai.gpt-oss" in id -> {
+            if (level == AiReasoningLevel.OFF) null else mapOf("reasoning_effort" to effort)
+        }
+        else -> null
+    }
 }
 
 /** Converse requires alternating roles, so consecutive same-role messages (e.g. tool results) merge. */

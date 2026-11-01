@@ -203,7 +203,10 @@ fun AiProviderEditScreen(
                     if (imageProvider) AppText(stringResource(R.string.ai_image_provider_hint))
                     ClickableSettingItem(
                         title = stringResource(R.string.ai_api_key),
-                        description = stringResource(R.string.ai_api_key_summary),
+                        description = stringResource(
+                            if (state.protocol == AiProtocol.AWS_BEDROCK_CONVERSE) R.string.ai_bedrock_api_key_summary
+                            else R.string.ai_api_key_summary
+                        ),
                         onClick = {
                             apiKeyDraft = state.apiKey
                             showApiKeyDialog = true

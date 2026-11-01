@@ -1,14 +1,84 @@
 package io.legado.app.data.repository.ai
 
+import io.legado.app.domain.model.AiCapability
+import io.legado.app.domain.model.AiGenerateRequest
+import io.legado.app.domain.model.AiGenerationParams
 import io.legado.app.domain.model.AiMessage
 import io.legado.app.domain.model.AiMessageRole
+import io.legado.app.domain.model.AiModelConfig
+import io.legado.app.domain.model.AiProtocol
+import io.legado.app.domain.model.AiProviderConfig
+import io.legado.app.domain.model.AiReasoningLevel
 import io.legado.app.domain.model.AiToolCall
 import kotlinx.coroutines.channels.Channel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 import okio.Buffer
 
 class BedrockConverseHandlerTest {
+
+    private fun request(
+        modelId: String,
+        level: AiReasoningLevel,
+        maxTokens: Int? = null,
+        messages: List<AiMessage> = listOf(AiMessage(AiMessageRole.USER, "hi")),
+    ) = AiGenerateRequest(
+        model = AiModelConfig(
+            id = "m",
+            provider = AiProviderConfig("p", "AWS Bedrock", AiProtocol.AWS_BEDROCK_CONVERSE, "https://bedrock-runtime.us-east-1.amazonaws.com", "key"),
+            displayName = modelId,
+            modelId = modelId,
+            capabilities = setOf(AiCapability.REASONING),
+        ),
+        messages = messages,
+        params = AiGenerationParams(temperature = 0.3f, maxOutputTokens = maxTokens, topP = 0.9f, reasoningLevel = level),
+    )
+
+    @Test
+    fun claudeThinkingUsesBudgetAboveMaxTokensAndDropsSampling() {
+        val config = mutableMapOf<String, Any>("maxTokens" to 2048, "temperature" to 0.3f, "topP" to 0.9f)
+
+        val fields = request("us.anthropic.claude-sonnet-4-20250514-v1:0", AiReasoningLevel.HIGH)
+            .bedrockReasoningFields(config)
+
+        assertEquals(mapOf("thinking" to mapOf("type" to "enabled", "budget_tokens" to 8_000)), fields)
+        assertEquals(mapOf<String, Any>("maxTokens" to 12_096), config)
+    }
+
+    @Test
+    fun claudeThinkingStaysOffAfterToolCalls() {
+        val messages = listOf(
+            AiMessage(AiMessageRole.USER, "hi"),
+            AiMessage(AiMessageRole.ASSISTANT, "", toolCalls = listOf(AiToolCall("c", "t", "{}"))),
+            AiMessage(AiMessageRole.TOOL, "ok", toolCallId = "c"),
+        )
+        val fields = request("anthropic.claude-sonnet-4-20250514-v1:0", AiReasoningLevel.MEDIUM, messages = messages)
+            .bedrockReasoningFields(mutableMapOf())
+
+        assertEquals(mapOf("thinking" to mapOf("type" to "disabled")), fields)
+    }
+
+    @Test
+    fun novaAndGptOssUseTheirOwnReasoningFields() {
+        val novaConfig = mutableMapOf<String, Any>("maxTokens" to 1000, "temperature" to 0.3f)
+        assertEquals(
+            mapOf("reasoningConfig" to mapOf("type" to "enabled", "maxReasoningEffort" to "high")),
+            request("us.amazon.nova-2-lite-v1:0", AiReasoningLevel.MAX).bedrockReasoningFields(novaConfig)
+        )
+        assertEquals(emptyMap<String, Any>(), novaConfig)
+
+        assertEquals(
+            mapOf("reasoning_effort" to "low"),
+            request("openai.gpt-oss-120b-1:0", AiReasoningLevel.LOW).bedrockReasoningFields(mutableMapOf())
+        )
+    }
+
+    @Test
+    fun autoLevelOrOtherModelsSendNoReasoningFields() {
+        assertNull(request("us.anthropic.claude-sonnet-4-20250514-v1:0", AiReasoningLevel.AUTO).bedrockReasoningFields(mutableMapOf()))
+        assertNull(request("meta.llama3-70b-instruct-v1:0", AiReasoningLevel.HIGH).bedrockReasoningFields(mutableMapOf()))
+    }
 
     @Test
     fun systemMessagesAreDroppedAndSameRoleTurnsMerge() {
